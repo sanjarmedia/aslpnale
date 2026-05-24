@@ -5,11 +5,85 @@ import threading
 import zipfile
 import json
 import io
+import os
+import psycopg2
+import psycopg2.extras
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app)
+
+# Database Setup
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://neondb_owner:npg_L5UPGRb7jBtJ@ep-wild-rice-aplif0sp-pooler.c-7.us-east-1.aws.neon.tech/neondb?sslmode=require")
+
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL)
+
+def init_db():
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS asl_cache (
+                key VARCHAR(50) PRIMARY KEY,
+                data JSONB,
+                synced_at VARCHAR(50),
+                token TEXT,
+                total INT
+            )
+        ''')
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print("DB Init Error:", e)
+
+init_db()
+
+def get_rcp_cache():
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute("SELECT data, synced_at, token, total FROM asl_cache WHERE key = 'rcp_cache'")
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if row:
+            return {
+                "receipts": row['data'] or [],
+                "synced_at": row['synced_at'],
+                "token": row['token'],
+                "total": row['total']
+            }
+    except Exception as e:
+        print("DB Error get:", e)
+    return {"receipts": [], "synced_at": None, "total": 0, "token": ""}
+
+def set_rcp_cache(receipts, token):
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        synced_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+        total = len(receipts)
+        cur.execute('''
+            INSERT INTO asl_cache (key, data, synced_at, token, total)
+            VALUES ('rcp_cache', %s, %s, %s, %s)
+            ON CONFLICT (key) DO UPDATE SET
+                data = EXCLUDED.data,
+                synced_at = EXCLUDED.synced_at,
+                token = EXCLUDED.token,
+                total = EXCLUDED.total
+        ''', (json.dumps(receipts), synced_at, token, total))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return synced_at, total
+    except Exception as e:
+        print("DB Error set:", e)
+        return time.strftime("%Y-%m-%dT%H:%M:%S"), len(receipts)
 
 # New API server (migrated from goods.aslbelgisi.uz on 2025-12-01)
 BASE_URL = "https://xtrace.aslbelgisi.uz"
@@ -129,7 +203,7 @@ def _extract_list(data):
     return []
 
 
-_rcp_cache = {"receipts": [], "synced_at": None, "total": 0, "token": ""}
+
 
 
 @app.route("/api/rcp-sync", methods=["POST"])
@@ -172,16 +246,14 @@ def rcp_sync():
             break
         cursor = next_cursor
 
-    _rcp_cache["receipts"] = all_receipts
-    _rcp_cache["total"] = len(all_receipts)
-    _rcp_cache["synced_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-    _rcp_cache["token"] = token
-    return jsonify({"count": len(all_receipts), "synced_at": _rcp_cache["synced_at"]})
+    synced_at, total_len = set_rcp_cache(all_receipts, token)
+    return jsonify({"count": total_len, "synced_at": synced_at})
 
 
 @app.route("/api/rcp-cached", methods=["GET"])
 def rcp_cached():
-    items = list(_rcp_cache["receipts"])
+    cache_data = get_rcp_cache()
+    items = list(cache_data["receipts"])
     date_from = request.args.get("dateFrom")
     date_to   = request.args.get("dateTo")
     rcp_type  = request.args.get("type", "").upper()
@@ -199,14 +271,15 @@ def rcp_cached():
     return jsonify({
         "receipts": items,
         "total": len(items),
-        "cached_total": _rcp_cache["total"],
-        "synced_at": _rcp_cache["synced_at"]
+        "cached_total": cache_data["total"],
+        "synced_at": cache_data["synced_at"]
     })
 
 
 @app.route("/api/rcp-detail/<receipt_id>", methods=["GET"])
 def rcp_detail(receipt_id):
-    token = _rcp_cache.get("token", "")
+    cache_data = get_rcp_cache()
+    token = cache_data.get("token", "")
     if not token:
         return jsonify({"error": "Нет токена — выполните синхронизацию заново"}), 400
     try:
